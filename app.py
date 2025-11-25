@@ -1,225 +1,207 @@
 import streamlit as st
-import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import time
 from datetime import datetime
+import pandas as pd
 import json
 
-# --- 1. 設定頁面與樣式 ---
-st.set_page_config(page_title="VibeFit Coach", page_icon="🏋️", layout="wide")
+# --- 1. 設定與資料庫連線 ---
+st.set_page_config(page_title="QuickFit Buttons", page_icon="⚡", layout="centered")
 
-# 隱藏 Streamlit 預設選單，讓介面更像 App
-st.markdown("""
-<style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    .stApp {padding-top: 50px;}
-    .stButton>button {width: 100%; border-radius: 20px; height: 3em;}
-    div[data-testid="stExpander"] {background-color: #f0f2f6; border-radius: 10px;}
-</style>
-""", unsafe_allow_html=True)
+# 定義你的「訓練菜單」與「重量範圍」
+# 格式： "動作名稱": [重量選項清單]
+MENU_CONFIG = {
+    # --- 下肢與核心 (Lower Body & Core) ---
+    "深蹲 (Squat)": [40, 50, 55, 60, 65, 70, 75, 80, 85, 90],
+    "硬舉 (Deadlift)": [60, 70, 80, 90, 100, 110, 120],
+    "羅馬尼亞硬舉 (RDL)": [40, 50, 60, 70, 80, 90], 
+    "保加利亞分腿蹲 (Bulgarian Split Squat)": [8, 10, 12.5, 15, 17.5, 20, 22.5], # 單手重量(kg)
+    "農夫走路 (Farmer's Walk)": [16, 20, 24, 28, 32, 36, 40], # 單手重量(kg)
+    "壺鈴擺盪 (Kettlebell Swing)": [12, 16, 20, 24, 28, 32],
+    
+    # --- 上肢推力與肩部 (Upper Body Push & Shoulder) ---
+    "臥推 (Bench Press)": [30, 35, 40, 45, 50, 55, 60, 70],
+    "肩推 (OHP)": [20, 25, 30, 35, 40, 45, 50],
+    "三頭下壓 (Tricep Pushdown)": [15, 20, 25, 30, 35, 40, 45],
 
-# --- 2. 連結 Google 服務 (Gemini & Sheets) ---
+    # --- 上肢拉力與背部 (Upper Body Pull & Back) ---
+    "單槓引體向上": [0],
+    "滑輪下拉 (Lat Pulldown)": [25, 30, 35, 40, 45, 50, 55, 60],
+    "啞鈴划船 (Row)": [12.5, 15, 17.5, 20, 22.5, 25, 30],
+    "臉拉 (Face Pull)": [15, 20, 25, 30, 35],
+    "二頭彎舉 (Curl)": [5, 7.5, 10, 12.5, 15],
 
-# 讀取 Secrets
-if "GEMINI_API_KEY" not in st.secrets:
-    st.error("請在 .streamlit/secrets.toml 設定 GEMINI_API_KEY")
-    st.stop()
-
-# 設定 Gemini
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-
-# 設定 Google Sheets (需在 secrets.toml 設定 gcp_service_account)
-# 格式範例：
-# [gcp_service_account]
-# type = "service_account"
-# project_id = "..."
-# ... (整個 JSON 內容)
-def get_google_sheet_client():
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    # 這裡假設你把 json 內容拆解放在 secrets 或者直接讀取 json 檔案
-    # 為了方便 codespace 開發，建議直接把 json 內容貼到 st.secrets["gcp_service_account"]
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    return client
-
-# 嘗試連線資料庫
-try:
-    client = get_google_sheet_client()
-    # 請將 'Workout_Logs' 替換成你的 Google Sheet 名稱
-    sheet = client.open("Workout_Logs").sheet1 
-except Exception as e:
-    st.warning(f"資料庫連線失敗 (僅開啟 AI 功能): {e}")
-    sheet = None
-
-# --- 3. AI 角色設定與初始化 ---
-
-SYSTEM_PROMPT = """
-(這裡保留原本的詳細 Prompt，為了版面簡潔我省略，請務必貼回原本那一大段 Role Definition)
-...
-重點補充：
-當用戶透過「快速回報按鈕」傳送數據時（格式如：[紀錄] 深蹲 100kg 5下），
-請直接記錄並給予簡短回饋，評估是否力竭，並建議下一組重量或休息時間。
-不要每次都問器材，除非用戶是第一次開始對話。
-"""
+    "其他": [] 
+}
 
 # 初始化 Session State
-if "chat_session" not in st.session_state:
-    model = genai.GenerativeModel('gemini-2.0-flash', system_instruction=SYSTEM_PROMPT) # 建議用 1.5 flash 比較快且便宜
-    st.session_state.chat_session = model.start_chat(history=[])
+if "local_logs" not in st.session_state:
+    st.session_state.local_logs = []
+if "selected_exercise" not in st.session_state:
+    st.session_state.selected_exercise = "深蹲 (Squat)" # 預設動作
+if "selected_weight" not in st.session_state:
+    st.session_state.selected_weight = 50.0 # 預設重量
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# 連線 Google Sheets (保持原樣)
+def get_sheet():
+    try:
+        if "gcp_service_account" not in st.secrets:
+            return None
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        return client.open("Workout_Logs").sheet1
+    except Exception:
+        return None
 
-if "workout_start_time" not in st.session_state:
-    st.session_state.workout_start_time = time.time()
+sheet = get_sheet()
 
-if 'rest_end_time' not in st.session_state:
-    st.session_state.rest_end_time = 0.0
+# --- Helper Functions: 按鈕回呼函式 ---
+def set_exercise(ex_name):
+    st.session_state.selected_exercise = ex_name
+    # 切換動作時，預設重量歸零或設為該動作的第一個選項
+    weights = MENU_CONFIG[ex_name]
+    if weights:
+        st.session_state.selected_weight = float(weights[0])
+    else:
+        st.session_state.selected_weight = 0.0
 
-# --- 4. 功能區塊：JavaScript 懸浮計時器 & 總時間 ---
+def set_weight(w_val):
+    st.session_state.selected_weight = float(w_val)
 
-# 計算總運動時間
-total_elapsed = int(time.time() - st.session_state.workout_start_time)
-total_mins, total_secs = divmod(total_elapsed, 60)
+# --- 2. 介面設計 ---
+st.title("⚡ QuickFit 極速紀錄")
 
-# 準備計時器的參數
-now_ts = time.time()
-rest_remaining = max(0, st.session_state.rest_end_time - now_ts)
-end_time_str = f"{st.session_state.rest_end_time:.3f}"
+# === A. 動作快選區 ===
+st.caption("1️⃣ 選擇動作")
+exercises = list(MENU_CONFIG.keys())
+# 建立 4 欄的按鈕網格
+cols = st.columns(4)
+for i, ex in enumerate(exercises):
+    with cols[i % 4]:
+        # 依據是否被選中來改變按鈕樣式 (Streamlit 按鈕無法直接變色，但我們可以用 type="primary" 來標示)
+        is_selected = (ex == st.session_state.selected_exercise)
+        st.button(
+            ex.split()[0], # 按鈕上只顯示中文簡稱，比較整齊
+            key=f"btn_ex_{i}",
+            type="primary" if is_selected else "secondary",
+            on_click=set_exercise,
+            args=(ex,),
+            use_container_width=True
+        )
 
-# 注入 JS 程式碼 (修復版)
-timer_html = f"""
-<div id="sticky-header" style="
-    position: fixed; top: 0; left: 0; width: 100%; background: #0E1117; 
-    z-index: 9999; border-bottom: 2px solid #FF4B4B; padding: 10px 20px;
-    display: flex; justify-content: space-between; align-items: center; color: white; font-family: monospace;">
-    
-    <div>
-        <span style="font-size: 12px; color: #aaa;">總時間</span><br>
-        <span id="total-timer" style="font-size: 18px; font-weight: bold;">{total_mins:02d}:{total_secs:02d}</span>
-    </div>
-    
-    <div style="text-align: right;">
-        <span style="font-size: 12px; color: #aaa;">組間休息</span><br>
-        <span id="rest-timer" style="font-size: 24px; font-weight: bold; color: {'#00FF00' if rest_remaining == 0 else '#FF4B4B'};">
-            --:--
-        </span>
-    </div>
-</div>
-<div style="height: 60px;"></div> <script>
-(function() {{
-    const restEndTime = {end_time_str};
-    const startTime = {st.session_state.workout_start_time};
-    
-    function updateTimers() {{
-        const now = Date.now() / 1000;
+# === B. 重量快選區 (動態生成) ===
+current_ex = st.session_state.selected_exercise
+weight_options = MENU_CONFIG[current_ex]
+
+if weight_options:
+    st.caption(f"2️⃣ 選擇重量 (目前動作: {current_ex})")
+    w_cols = st.columns(5) # 5 欄網格
+    for i, w in enumerate(weight_options):
+        with w_cols[i % 5]:
+            is_w_selected = (float(w) == st.session_state.selected_weight)
+            st.button(
+                f"{w}",
+                key=f"btn_w_{current_ex}_{w}", # Key 必須唯一
+                type="primary" if is_w_selected else "secondary",
+                on_click=set_weight,
+                args=(w,),
+                use_container_width=True
+            )
+else:
+    st.caption("請直接在下方輸入重量")
+
+st.divider()
+
+# === C. 最終確認與送出表單 ===
+st.caption("3️⃣ 確認與微調細節")
+
+with st.form("final_check_form", clear_on_submit=False):
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        # 這裡的 value 會自動讀取剛剛按鈕點選後的 session_state
+        # 如果選「其他」，允許使用者自己打字
+        if current_ex == "其他":
+             final_exercise = st.text_input("輸入動作名稱", value="")
+        else:
+             # 這裡用 text_input 設為 disabled 讓它顯示但不能改，或者允許改都可以
+             final_exercise = st.text_input("動作", value=current_ex)
+             
+    with c2:
+        # 允許手動微調重量 (例如想做 62.5kg，但按鈕只有 60 和 65)
+        final_weight = st.number_input(
+            "重量 (kg)", 
+            value=st.session_state.selected_weight, 
+            step=1.25
+        )
+
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        final_reps = st.number_input("次數", value=8, step=1)
+    with c4:
+        final_rpe = st.number_input("RPE (強度)", value=8, min_value=1, max_value=10)
+    with c5:
+        final_failure = st.checkbox("💀 力竭", value=False)
+
+    submit_btn = st.form_submit_button("✅ 確認紀錄", type="primary", use_container_width=True)
+
+# === D. 處理送出邏輯 ===
+if submit_btn:
+    if not final_exercise:
+        st.error("動作名稱不能為空")
+    else:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        date_today = datetime.now().strftime("%Y-%m-%d")
         
-        // 1. 更新總時間
-        const totalElapsed = Math.floor(now - startTime);
-        const tMins = Math.floor(totalElapsed / 60);
-        const tSecs = Math.floor(totalElapsed % 60);
-        const tEl = document.getElementById("total-timer");
-        if(tEl) tEl.innerText = 
-            (tMins < 10 ? "0" : "") + tMins + ":" + (tSecs < 10 ? "0" : "") + tSecs;
-
-        // 2. 更新倒數計時
-        const rEl = document.getElementById("rest-timer");
-        const remaining = restEndTime - now;
+        # 資料物件
+        entry = {
+            "Time": ts,
+            "Date": date_today,
+            "Exercise": final_exercise,
+            "Weight": final_weight,
+            "Reps": final_reps,
+            "RPE": final_rpe,
+            "Failure": "Yes" if final_failure else "No"
+        }
         
-        if (remaining <= 0) {{
-            if(rEl) {{
-                rEl.innerText = "READY";
-                rEl.style.color = "#00FF00";
-            }}
-        }} else {{
-            const rMins = Math.floor(remaining / 60);
-            const rSecs = Math.floor(remaining % 60);
-            if(rEl) {{
-                rEl.innerText = (rMins < 10 ? "0" : "") + rMins + ":" + (rSecs < 10 ? "0" : "") + rSecs;
-                rEl.style.color = "#FF4B4B";
-            }}
-        }}
-    }}
-    
-    setInterval(updateTimers, 1000);
-    updateTimers();
-}})();
-</script>
-"""
-st.markdown(timer_html, unsafe_allow_html=True)
-
-# --- 5. 核心介面 ---
-
-st.title("🦴 OrthoFit Coach")
-
-# --- 區塊 A: 快速輸入 (取代一直打字) ---
-with st.expander("📝 快速記錄 & 啟動休息", expanded=True):
-    with st.form("log_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            exercise = st.selectbox("動作", ["深蹲", "硬舉", "臥推", "肩推", "划船", "分腿蹲", "跑步"])
-            weight = st.number_input("重量 (kg)", min_value=0.0, step=2.5, value=0.0)
-        with c2:
-            reps = st.number_input("次數 / 時間", min_value=0, step=1, value=0)
-            rpe = st.slider("自覺強度 (RPE)", 1, 10, 8)
+        # 1. 存入 Session State (本地清單)
+        st.session_state.local_logs.append(entry)
         
-        is_failure = st.checkbox("💀 力竭 (Failure)")
-        
-        # 休息時間選擇
-        rest_select = st.select_slider("休息時間", options=[30, 60, 90, 120, 180, 240, 300], value=120)
-        
-        submitted = st.form_submit_button("✅ 記錄並發送給 AI")
-
-    if submitted:
-        # 1. 組裝訊息
-        fail_str = "(力竭)" if is_failure else ""
-        user_msg = f"[紀錄] {exercise} {weight}kg x {reps}下, RPE {rpe} {fail_str}。"
-        
-        # 2. 寫入 Google Sheet
+        # 2. 存入 Google Sheets
         if sheet:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
-                sheet.append_row([timestamp, exercise, weight, reps, rpe, is_failure])
-                st.toast(f"已儲存至資料庫: {exercise}", icon="💾")
+                sheet.append_row(list(entry.values()))
+                st.toast(f"已儲存: {final_exercise} {final_weight}kg", icon="☁️")
             except Exception as e:
-                st.error(f"寫入失敗: {e}")
-        
-        # 3. 設定倒數計時器
-        st.session_state.rest_end_time = time.time() + rest_select
-        
-        # 4. 更新對話狀態，觸發 AI 回應
-        st.session_state.messages.append({"role": "user", "content": user_msg})
-        
-        # 強制觸發 Rerun 以更新聊天室與計時器
+                st.error(f"雲端錯誤: {e}")
+        else:
+             st.toast(f"已暫存 (無雲端): {final_exercise}", icon="💾")
+
+# === E. 顯示結果與 RPE 說明 ===
+
+# RPE 說明摺疊區
+with st.expander("❓ RPE 是什麼？ (點擊展開說明)"):
+    st.markdown("""
+    **RPE (自覺強度量表) 1-10 分：**
+    * **10**: 極限，完全做不動下一標準下 (力竭)。
+    * **9**: 很重，大概還能勉強做 1 下。
+    * **8**: 重，但還有保留，大概還能做 2 下。 (增肌甜蜜點)
+    * **7**: 還算輕鬆，大概還能做 3 下。
+    """)
+
+# 顯示今日紀錄表格
+if st.session_state.local_logs:
+    st.subheader("📊 今日紀錄")
+    df = pd.DataFrame(st.session_state.local_logs)
+    # 只顯示重要欄位
+    st.dataframe(df[["Exercise", "Weight", "Reps", "RPE"]], use_container_width=True)
+    
+    # JSON 輸出
+    st.subheader("📋 JSON 匯出")
+    json_str = json.dumps(st.session_state.local_logs, ensure_ascii=False, indent=2)
+    st.code(json_str, language="json")
+    
+    if st.button("清除所有紀錄"):
+        st.session_state.local_logs = []
         st.rerun()
-
-# --- 區塊 B: 對話視窗 ---
-st.subheader("💬 AI 教練回饋")
-
-# 顯示歷史訊息
-for msg in st.session_state.messages:
-    role = "user" if msg["role"] == "user" else "assistant"
-    with st.chat_message(role):
-        st.markdown(msg["content"])
-
-# 處理 AI 回應 (當最後一條訊息是 user 時觸發)
-if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-    with st.chat_message("assistant"):
-        with st.spinner("思考下一步建議..."):
-            try:
-                # 使用 chat_session 保持上下文
-                user_content = st.session_state.messages[-1]["content"]
-                response = st.session_state.chat_session.send_message(user_content)
-                
-                st.markdown(response.text)
-                st.session_state.messages.append({"role": "assistant", "content": response.text})
-            except Exception as e:
-                st.error(f"AI 連線錯誤: {e}")
-
-# 傳統輸入框 (補救用，或問其他問題)
-if prompt := st.chat_input("輸入其他問題 (例如: 膝蓋有點不舒服怎麼辦?)"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    st.rerun()
